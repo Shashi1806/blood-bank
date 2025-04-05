@@ -1,190 +1,249 @@
 const express = require('express');
 const router = express.Router();
-const { body, validationResult } = require('express-validator');
+const { body, query, validationResult } = require('express-validator');
 const { auth } = require('../middleware/auth');
-const BloodRequest = require('../models/BloodRequest');
+const Donation = require('../models/Donation');
 const User = require('../models/User');
+const BloodBank = require('../models/BloodBank');
 
-// Create new blood request
-router.post('/',
-  [
-    auth,
-    body('patientName').notEmpty().withMessage('Patient name is required'),
-    body('bloodGroup').isIn(['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-'])
-      .withMessage('Invalid blood group'),
-    body('units').notEmpty().withMessage('Units required'),
-    body('hospital').notEmpty().withMessage('Hospital is required'),
-    body('requiredBy').notEmpty().withMessage('Required by date is required'),
-    body('reason').notEmpty().withMessage('Reason is required'),
-    body('contact').notEmpty().withMessage('Contact information is required'),
-    body('urgency').isIn(['normal', 'urgent', 'critical']).withMessage('Invalid urgency level')
-  ],
-  async (req, res) => {
-    try {
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) {
-        return res.status(400).json({ errors: errors.array() });
-      }
+// Validation middleware
+const validate = (req, res, next) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({
+      success: false,
+      errors: errors.array()
+    });
+  }
+  next();
+};
 
-      const request = new BloodRequest({
-        ...req.body,
-        requester: req.user._id,
-        status: 'in-progress'
+// Record new donation
+router.post('/', [
+  auth,
+  body('bloodBank').isMongoId().withMessage('Valid blood bank ID is required'),
+  body('units')
+    .isFloat({ min: 1, max: 5 })
+    .withMessage('Units must be between 1 and 5'),
+  body('donationDate')
+    .isISO8601()
+    .custom(value => new Date(value) <= new Date())
+    .withMessage('Donation date cannot be in the future'),
+  validate
+], async (req, res) => {
+  try {
+    // Verify blood bank exists
+    const bloodBank = await BloodBank.findById(req.body.bloodBank);
+    if (!bloodBank) {
+      return res.status(400).json({
+        success: false,
+        message: 'Blood bank not found'
       });
+    }
 
-      await request.save();
+    // Check eligibility (3 months since last donation)
+    const lastDonation = await Donation.findOne({
+      donor: req.user._id,
+      donationDate: {
+        $gte: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000)
+      }
+    });
 
-      // Find potential donors
-      const donors = await User.find({
-        bloodGroup: req.body.bloodGroup,
-        isDonor: true,
-        location: {
-          $near: {
-            $geometry: {
-              type: 'Point',
-              coordinates: req.body.location?.coordinates || [0, 0]
-            },
-            $maxDistance: req.body.urgency === 'critical' ? 100000 : 50000 // 100km for critical, 50km for others
+    if (lastDonation) {
+      return res.status(400).json({
+        success: false,
+        message: 'Must wait 3 months between donations',
+        nextEligibleDate: new Date(lastDonation.donationDate.getTime() + 90 * 24 * 60 * 60 * 1000)
+      });
+    }
+
+    const donation = new Donation({
+      ...req.body,
+      donor: req.user._id
+    });
+
+    await donation.save();
+
+    // Update user stats
+    const user = await User.findById(req.user._id);
+    user.lastDonation = req.body.donationDate;
+    user.donationCount += 1;
+    user.rewardPoints += 100; // Base points for donation
+    user.livesImpacted += 3; // Each donation can save up to 3 lives
+
+    // Update streak with validation
+    const lastDonationDate = new Date(user.lastDonation);
+    const threeMonthsAgo = new Date();
+    threeMonthsAgo.setMonth(threeMonthsAgo.getMonth() - 3);
+    
+    if (lastDonationDate >= threeMonthsAgo) {
+      user.streak = (user.streak || 0) + 1;
+      user.rewardPoints += user.streak * 10; // Bonus points for streak
+    } else {
+      user.streak = 1;
+    }
+
+    // Set next eligible date
+    const nextEligibleDate = new Date(req.body.donationDate);
+    nextEligibleDate.setMonth(nextEligibleDate.getMonth() + 3);
+    user.nextEligibleDate = nextEligibleDate;
+
+    // Update level based on donation count
+    user.level = calculateUserLevel(user.donationCount);
+    user.levelProgress = calculateLevelProgress(user.donationCount);
+
+    // Award badges
+    await updateUserBadges(user);
+
+    await user.save();
+
+    // Update blood bank inventory
+    await BloodBank.findByIdAndUpdate(bloodBank._id, {
+      $inc: { [`bloodInventory.${req.body.bloodGroup}.units`]: req.body.units }
+    });
+
+    res.status(201).json({
+      success: true,
+      data: {
+        donation,
+        userStats: {
+          donationCount: user.donationCount,
+          rewardPoints: user.rewardPoints,
+          level: user.level,
+          levelProgress: user.levelProgress,
+          streak: user.streak,
+          livesImpacted: user.livesImpacted,
+          badges: user.badges,
+          nextEligibleDate: user.nextEligibleDate
+        }
+      }
+    });
+  } catch (err) {
+    console.error('Donation creation error:', err);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to create donation'
+    });
+  }
+});
+
+// Get user's donation history with pagination
+router.get('/history', [
+  auth,
+  query('page').optional().isInt({ min: 1 }),
+  query('limit').optional().isInt({ min: 1, max: 50 }),
+  validate
+], async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+
+    const [donations, total] = await Promise.all([
+      Donation.find({ donor: req.user._id })
+        .populate('bloodBank', 'name address')
+        .sort({ donationDate: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit),
+      Donation.countDocuments({ donor: req.user._id })
+    ]);
+
+    res.json({
+      success: true,
+      data: donations,
+      pagination: {
+        current: page,
+        total: Math.ceil(total / limit),
+        limit
+      }
+    });
+  } catch (err) {
+    console.error('Get donation history error:', err);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch donation history'
+    });
+  }
+});
+
+// Get donation statistics
+router.get('/stats', auth, async (req, res) => {
+  try {
+    const [totalStats, monthlyStats] = await Promise.all([
+      Donation.aggregate([
+        { $match: { donor: req.user._id } },
+        { 
+          $group: { 
+            _id: null, 
+            totalDonations: { $sum: 1 },
+            totalUnits: { $sum: '$units' }
           }
         }
-      }).select('email name');
-
-      // TODO: Send notifications to potential donors
-      // This would be implemented with your notification system
-
-      res.status(201).json(request);
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ message: 'Server error' });
-    }
-  }
-);
-
-// Get my requests
-router.get('/my-requests', auth, async (req, res) => {
-  try {
-    const requests = await BloodRequest.find({ requester: req.user._id })
-      .sort({ createdAt: -1 });
-
-    res.json(requests);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// Get nearby requests
-router.get('/nearby', auth, async (req, res) => {
-  try {
-    const { longitude, latitude, maxDistance = 50000 } = req.query; // maxDistance in meters (default 50km)
-
-    const requests = await BloodRequest.find({
-      status: { $in: ['pending', 'in-progress'] },
-      bloodGroup: req.user.bloodGroup,
-      location: {
-        $near: {
-          $geometry: {
-            type: 'Point',
-            coordinates: [parseFloat(longitude), parseFloat(latitude)]
-          },
-          $maxDistance: parseInt(maxDistance)
+      ]),
+      Donation.aggregate([
+        {
+          $match: {
+            donor: req.user._id,
+            donationDate: { $gte: new Date(Date.now() - 365 * 24 * 60 * 60 * 1000) }
+          }
+        },
+        {
+          $group: {
+            _id: { $month: '$donationDate' },
+            count: { $sum: 1 },
+            units: { $sum: '$units' }
+          }
         }
-      }
-    })
-    .populate('requester', 'name')
-    .sort({ urgency: -1, createdAt: -1 });
+      ])
+    ]);
 
-    res.json(requests);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
+    const stats = {
+      total: {
+        donations: totalStats[0]?.totalDonations || 0,
+        units: totalStats[0]?.totalUnits || 0,
+        livesImpacted: (totalStats[0]?.totalDonations || 0) * 3
+      },
+      monthly: monthlyStats.reduce((acc, { _id, count, units }) => {
+        acc[_id] = { count, units };
+        return acc;
+      }, {})
+    };
 
-// Update request status
-router.patch('/:id/status',
-  [
-    auth,
-    body('status').isIn(['pending', 'in-progress', 'fulfilled', 'cancelled'])
-      .withMessage('Invalid status')
-  ],
-  async (req, res) => {
-    try {
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) {
-        return res.status(400).json({ errors: errors.array() });
-      }
-
-      const request = await BloodRequest.findById(req.params.id);
-      if (!request) {
-        return res.status(404).json({ message: 'Request not found' });
-      }
-
-      // Only requester can update the status
-      if (request.requester.toString() !== req.user._id.toString()) {
-        return res.status(403).json({ message: 'Not authorized' });
-      }
-
-      request.status = req.body.status;
-      await request.save();
-
-      res.json(request);
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ message: 'Server error' });
-    }
-  }
-);
-
-// Respond to a request (for donors)
-router.post('/:id/respond', auth, async (req, res) => {
-  try {
-    const request = await BloodRequest.findById(req.params.id);
-    if (!request) {
-      return res.status(404).json({ message: 'Request not found' });
-    }
-
-    // Check if user is already a donor for this request
-    if (request.donors.some(d => d.donor.toString() === req.user._id.toString())) {
-      return res.status(400).json({ message: 'Already responded to this request' });
-    }
-
-    request.donors.push({
-      donor: req.user._id,
-      status: 'pending'
+    res.json({
+      success: true,
+      data: stats
     });
-    request.donorsResponded = request.donors.length;
-
-    await request.save();
-
-    // TODO: Send notification to requester
-
-    res.json(request);
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Server error' });
+    console.error('Get donation stats error:', err);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch donation statistics'
+    });
   }
 });
 
-// Delete request
-router.delete('/:id', auth, async (req, res) => {
-  try {
-    const request = await BloodRequest.findById(req.params.id);
-    if (!request) {
-      return res.status(404).json({ message: 'Request not found' });
-    }
+// Helper functions
+function calculateUserLevel(donationCount) {
+  if (donationCount >= 50) return 'Platinum';
+  if (donationCount >= 25) return 'Gold';
+  if (donationCount >= 10) return 'Silver';
+  return 'Bronze';
+}
 
-    // Only requester can delete the request
-    if (request.requester.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ message: 'Not authorized' });
-    }
+function calculateLevelProgress(donationCount) {
+  if (donationCount >= 50) return 100;
+  if (donationCount >= 25) return Math.min(((donationCount - 25) / 25) * 100, 100);
+  if (donationCount >= 10) return Math.min(((donationCount - 10) / 15) * 100, 100);
+  return Math.min((donationCount / 10) * 100, 100);
+}
 
-    await request.remove();
-    res.json({ message: 'Request deleted successfully' });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
+async function updateUserBadges(user) {
+  const badges = new Set(user.badges || []);
+  
+  badges.add('First Donation');
+  if (user.donationCount >= 5) badges.add('Regular Donor');
+  if (user.livesImpacted >= 50) badges.add('Life Saver');
+  
+  user.badges = Array.from(badges);
+}
 
 module.exports = router;

@@ -1,123 +1,109 @@
 const mongoose = require('mongoose');
+const validator = require('validator');
 
 const userSchema = new mongoose.Schema({
   name: {
     type: String,
-    required: true,
-    trim: true
+    required: [true, 'Name is required'],
+    trim: true,
+    minlength: [2, 'Name must be at least 2 characters long'],
+    maxlength: [50, 'Name cannot exceed 50 characters']
   },
   email: {
     type: String,
-    required: true,
+    required: [true, 'Email is required'],
     unique: true,
     trim: true,
-    lowercase: true
+    lowercase: true,
+    validate: [validator.isEmail, 'Please provide a valid email']
   },
   password: {
     type: String,
     required: function() {
-      return !this.googleId; // Password is required only if not using Google login
-    }
+      return !this.googleId;
+    },
+    minlength: [8, 'Password must be at least 8 characters long'],
+    select: false
   },
   googleId: {
     type: String,
-    unique: true,
     sparse: true
   },
   picture: {
     type: String,
-    default: '/uploads/default-avatar.png'
+    default: '/uploads/default-avatar.png',
+    validate: {
+      validator: function(v) {
+        return /\.(jpg|jpeg|png|gif)$/i.test(v);
+      },
+      message: 'Picture must be a valid image URL'
+    }
   },
   bloodGroup: {
     type: String,
-    required: true,
-    enum: ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-']
-  },
-  isDonor: {
-    type: Boolean,
-    default: true
-  },
-  isAdmin: {
-    type: Boolean,
-    default: false
-  },
-  lastDonation: Date,
-  donationCount: {
-    type: Number,
-    default: 0
-  },
-  rewardPoints: {
-    type: Number,
-    default: 0
-  },
-  badges: [{
-    type: String,
-    enum: ['first_donation', 'regular_donor', 'super_donor', 'lifesaver']
-  }],
-  address: {
-    street: String,
-    city: String,
-    state: String,
-    zipCode: String,
-    coordinates: {
-      type: {
-        type: String,
-        enum: ['Point'],
-        default: 'Point'
-      },
-      coordinates: {
-        type: [Number],
-        default: [0, 0]
-      }
+    required: [true, 'Blood group is required'],
+    enum: {
+      values: ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-'],
+      message: '{VALUE} is not a valid blood group'
     }
   },
-  phoneNumber: {
-    type: String,
-    trim: true
+  roles: {
+    isDonor: { type: Boolean, default: true },
+    isAdmin: { type: Boolean, default: false },
+    isVerified: { type: Boolean, default: false }
   },
-  emergencyContact: {
-    name: String,
-    relationship: String,
-    phoneNumber: String
-  },
-  medicalInfo: {
-    weight: Number,
-    height: Number,
-    lastCheckup: Date,
-    medications: [String],
-    conditions: [String]
-  },
-  preferences: {
-    notifications: {
-      email: {
-        type: Boolean,
-        default: true
-      },
-      sms: {
-        type: Boolean,
-        default: false
-      },
-      push: {
-        type: Boolean,
-        default: true
+  contact: {
+    phone: {
+      type: String,
+      trim: true,
+      validate: {
+        validator: function(v) {
+          return !v || /^\+?[\d\s-]{10,}$/.test(v);
+        },
+        message: 'Invalid phone number format'
       }
     },
-    privacy: {
-      showProfile: {
-        type: Boolean,
-        default: true
-      },
-      showDonations: {
-        type: Boolean,
-        default: true
+    address: {
+      street: { type: String, trim: true },
+      city: { type: String, trim: true },
+      state: { type: String, trim: true },
+      zipCode: { type: String, trim: true },
+      location: {
+        type: {
+          type: String,
+          enum: ['Point'],
+          default: 'Point'
+        },
+        coordinates: {
+          type: [Number],
+          default: [0, 0]
+        }
       }
     }
+  },
+  donationHistory: {
+    lastDonation: Date,
+    totalDonations: { type: Number, default: 0 },
+    nextEligibleDate: Date
+  },
+  rewards: {
+    points: { type: Number, default: 0 },
+    level: { type: String, default: 'Bronze' },
+    badges: [String]
   }
 }, {
-  timestamps: true
+  timestamps: true,
+  toJSON: { virtuals: true },
+  toObject: { virtuals: true }
 });
 
-// Index for geospatial queries
-userSchema.index({ "address.coordinates": "2dsphere" });
+// Define indexes once
+userSchema.index({ 'contact.address.location': '2dsphere' });
+userSchema.index({ email: 1 }, { unique: true });
+userSchema.index({ googleId: 1 }, { sparse: true });
+userSchema.index({ bloodGroup: 1 });
+userSchema.index({ 'roles.isDonor': 1 });
+userSchema.index({ 'rewards.points': -1 });
 
-module.exports = mongoose.model('User', userSchema);
+const User = mongoose.model('User', userSchema);
+module.exports = User;

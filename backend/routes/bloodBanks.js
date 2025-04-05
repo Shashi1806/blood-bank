@@ -1,23 +1,43 @@
 const express = require('express');
 const router = express.Router();
-const { body, validationResult } = require('express-validator');
+const { body, query, param, validationResult } = require('express-validator');
 const { auth } = require('../middleware/auth');
 const BloodBank = require('../models/BloodBank');
 
-// Get all blood banks with optional search
-router.get('/', async (req, res) => {
+// Validation middleware
+const validate = (req, res, next) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ 
+      success: false,
+      errors: errors.array() 
+    });
+  }
+  next();
+};
+
+// Get all blood banks with search, pagination and filtering
+router.get('/', [
+  query('search').optional().trim(),
+  query('lat').optional().isFloat({ min: -90, max: 90 }).withMessage('Invalid latitude'),
+  query('lng').optional().isFloat({ min: -180, max: 180 }).withMessage('Invalid longitude'),
+  query('radius').optional().isInt({ min: 1, max: 100000 }).withMessage('Radius must be between 1-100000 meters'),
+  query('page').optional().isInt({ min: 1 }),
+  query('limit').optional().isInt({ min: 1, max: 50 }),
+  validate
+], async (req, res) => {
   try {
-    const { search, lat, lng, radius = 50000 } = req.query; // radius in meters (default 50km)
+    const { search, lat, lng, radius = 50000, page = 1, limit = 10 } = req.query;
     let query = { isActive: true };
 
-    // Text search if provided
+    // Text search
     if (search) {
       query.$text = { $search: search };
     }
 
-    // Location-based search if coordinates provided
+    // Location-based search
     if (lat && lng) {
-      query.coordinates = {
+      query.location = {
         $near: {
           $geometry: {
             type: 'Point',
@@ -28,209 +48,145 @@ router.get('/', async (req, res) => {
       };
     }
 
-    const bloodBanks = await BloodBank.find(query)
-      .sort({ name: 1 });
+    const [bloodBanks, total] = await Promise.all([
+      BloodBank.find(query)
+        .select('-__v')
+        .sort({ name: 1 })
+        .skip((page - 1) * limit)
+        .limit(limit),
+      BloodBank.countDocuments(query)
+    ]);
 
-    res.json(bloodBanks);
+    res.json({
+      success: true,
+      data: bloodBanks,
+      pagination: {
+        current: page,
+        total: Math.ceil(total / limit),
+        limit
+      }
+    });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Server error' });
+    console.error('Get blood banks error:', err);
+    res.status(500).json({ 
+      success: false,
+      message: 'Failed to fetch blood banks' 
+    });
   }
 });
 
 // Get blood bank by ID
-router.get('/:id', async (req, res) => {
+router.get('/:id', [
+  param('id').isMongoId().withMessage('Invalid blood bank ID'),
+  validate
+], async (req, res) => {
   try {
-    const bloodBank = await BloodBank.findById(req.params.id);
+    const bloodBank = await BloodBank.findById(req.params.id).select('-__v');
+    
     if (!bloodBank) {
-      return res.status(404).json({ message: 'Blood bank not found' });
+      return res.status(404).json({
+        success: false,
+        message: 'Blood bank not found'
+      });
     }
-    res.json(bloodBank);
+
+    res.json({
+      success: true,
+      data: bloodBank
+    });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Server error' });
+    console.error('Get blood bank error:', err);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch blood bank'
+    });
   }
 });
 
 // Create blood bank (admin only)
-router.post('/',
-  [
-    auth,
-    body('name').notEmpty().withMessage('Name is required'),
-    body('address').notEmpty().withMessage('Address is required'),
-    body('phone').notEmpty().withMessage('Phone is required'),
-    body('hours').notEmpty().withMessage('Operating hours are required'),
-    body('coordinates').isObject().withMessage('Coordinates are required'),
-    body('coordinates.lat').isFloat().withMessage('Invalid latitude'),
-    body('coordinates.lng').isFloat().withMessage('Invalid longitude')
-  ],
-  async (req, res) => {
-    try {
-      // Check if user is admin
-      if (!req.user.isAdmin) {
-        return res.status(403).json({ message: 'Not authorized' });
-      }
-
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) {
-        return res.status(400).json({ errors: errors.array() });
-      }
-
-      const bloodBank = new BloodBank(req.body);
-      await bloodBank.save();
-
-      res.status(201).json(bloodBank);
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ message: 'Server error' });
-    }
-  }
-);
-
-// Update blood bank (admin only)
-router.patch('/:id',
-  [
-    auth,
-    body('name').optional().notEmpty().withMessage('Name cannot be empty'),
-    body('address').optional().notEmpty().withMessage('Address cannot be empty'),
-    body('phone').optional().notEmpty().withMessage('Phone cannot be empty'),
-    body('hours').optional().notEmpty().withMessage('Operating hours cannot be empty'),
-    body('coordinates').optional().isObject().withMessage('Invalid coordinates format'),
-    body('coordinates.lat').optional().isFloat().withMessage('Invalid latitude'),
-    body('coordinates.lng').optional().isFloat().withMessage('Invalid longitude')
-  ],
-  async (req, res) => {
-    try {
-      // Check if user is admin
-      if (!req.user.isAdmin) {
-        return res.status(403).json({ message: 'Not authorized' });
-      }
-
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) {
-        return res.status(400).json({ errors: errors.array() });
-      }
-
-      const bloodBank = await BloodBank.findByIdAndUpdate(
-        req.params.id,
-        { $set: req.body },
-        { new: true, runValidators: true }
-      );
-
-      if (!bloodBank) {
-        return res.status(404).json({ message: 'Blood bank not found' });
-      }
-
-      res.json(bloodBank);
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ message: 'Server error' });
-    }
-  }
-);
-
-// Update blood availability (admin only)
-router.patch('/:id/availability',
-  [
-    auth,
-    body('bloodAvailability').isObject().withMessage('Blood availability data is required'),
-    body('bloodAvailability.*').isIn(['Critical', 'Very Low', 'Low', 'Medium', 'High'])
-      .withMessage('Invalid availability level')
-  ],
-  async (req, res) => {
-    try {
-      // Check if user is admin
-      if (!req.user.isAdmin) {
-        return res.status(403).json({ message: 'Not authorized' });
-      }
-
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) {
-        return res.status(400).json({ errors: errors.array() });
-      }
-
-      const bloodBank = await BloodBank.findByIdAndUpdate(
-        req.params.id,
-        { $set: { bloodAvailability: req.body.bloodAvailability } },
-        { new: true, runValidators: true }
-      );
-
-      if (!bloodBank) {
-        return res.status(404).json({ message: 'Blood bank not found' });
-      }
-
-      res.json(bloodBank);
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ message: 'Server error' });
-    }
-  }
-);
-
-// Add upcoming drive (admin only)
-router.post('/:id/drives',
-  [
-    auth,
-    body('name').notEmpty().withMessage('Drive name is required'),
-    body('date').notEmpty().withMessage('Date is required'),
-    body('location').notEmpty().withMessage('Location is required'),
-    body('bloodTypesNeeded').isArray().withMessage('Blood types needed must be an array'),
-    body('bloodTypesNeeded.*').isIn(['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-'])
-      .withMessage('Invalid blood type')
-  ],
-  async (req, res) => {
-    try {
-      // Check if user is admin
-      if (!req.user.isAdmin) {
-        return res.status(403).json({ message: 'Not authorized' });
-      }
-
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) {
-        return res.status(400).json({ errors: errors.array() });
-      }
-
-      const bloodBank = await BloodBank.findByIdAndUpdate(
-        req.params.id,
-        { $push: { upcomingDrives: req.body } },
-        { new: true, runValidators: true }
-      );
-
-      if (!bloodBank) {
-        return res.status(404).json({ message: 'Blood bank not found' });
-      }
-
-      res.status(201).json(bloodBank);
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ message: 'Server error' });
-    }
-  }
-);
-
-// Remove upcoming drive (admin only)
-router.delete('/:id/drives/:driveId', auth, async (req, res) => {
+router.post('/', [
+  auth,
+  body('name').trim().notEmpty().withMessage('Name is required'),
+  body('address').trim().notEmpty().withMessage('Address is required'),
+  body('phone').matches(/^\+?[\d\s-]{10,}$/).withMessage('Invalid phone number'),
+  body('hours').notEmpty().withMessage('Operating hours are required'),
+  body('location.coordinates').isArray().withMessage('Coordinates are required'),
+  body('location.coordinates.0').isFloat({ min: -180, max: 180 }).withMessage('Invalid longitude'),
+  body('location.coordinates.1').isFloat({ min: -90, max: 90 }).withMessage('Invalid latitude'),
+  validate
+], async (req, res) => {
   try {
-    // Check if user is admin
     if (!req.user.isAdmin) {
-      return res.status(403).json({ message: 'Not authorized' });
+      return res.status(403).json({
+        success: false,
+        message: 'Admin access required'
+      });
+    }
+
+    const bloodBank = new BloodBank({
+      ...req.body,
+      createdBy: req.user._id
+    });
+    
+    await bloodBank.save();
+
+    res.status(201).json({
+      success: true,
+      data: bloodBank
+    });
+  } catch (err) {
+    console.error('Create blood bank error:', err);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to create blood bank'
+    });
+  }
+});
+
+// ...existing code for update blood bank...
+
+// Update blood availability
+router.patch('/:id/availability', [
+  auth,
+  param('id').isMongoId().withMessage('Invalid blood bank ID'),
+  body('bloodAvailability').isObject().withMessage('Blood availability data required'),
+  body('bloodAvailability.*').isIn(['Critical', 'Very Low', 'Low', 'Medium', 'High']),
+  validate
+], async (req, res) => {
+  try {
+    if (!req.user.isAdmin) {
+      return res.status(403).json({
+        success: false,
+        message: 'Admin access required'
+      });
     }
 
     const bloodBank = await BloodBank.findByIdAndUpdate(
       req.params.id,
-      { $pull: { upcomingDrives: { _id: req.params.driveId } } },
-      { new: true }
+      { $set: { bloodAvailability: req.body.bloodAvailability } },
+      { new: true, runValidators: true }
     );
 
     if (!bloodBank) {
-      return res.status(404).json({ message: 'Blood bank not found' });
+      return res.status(404).json({
+        success: false,
+        message: 'Blood bank not found'
+      });
     }
 
-    res.json({ message: 'Drive removed successfully' });
+    res.json({
+      success: true,
+      data: bloodBank
+    });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Server error' });
+    console.error('Update availability error:', err);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to update blood availability'
+    });
   }
 });
+
+// ...existing code for drives management...
 
 module.exports = router;

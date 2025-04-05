@@ -1,34 +1,75 @@
 const express = require('express');
 const router = express.Router();
-const { body, validationResult } = require('express-validator');
+const { body, query, validationResult } = require('express-validator');
 const { auth } = require('../middleware/auth');
 const User = require('../models/User');
+
+// Constants
+const LEVELS = {
+  Bronze: { next: 'Silver', pointsNeeded: 1000, donationsNeeded: 10 },
+  Silver: { next: 'Gold', pointsNeeded: 2500, donationsNeeded: 25 },
+  Gold: { next: 'Platinum', pointsNeeded: 5000, donationsNeeded: 50 },
+  Platinum: { next: null, pointsNeeded: null, donationsNeeded: null }
+};
+
+const BADGES = [
+  {
+    id: 'first_donation',
+    name: 'First Donation',
+    description: 'Awarded for your first blood donation',
+    requirement: '1 donation'
+  },
+  {
+    id: 'regular_donor',
+    name: 'Regular Donor',
+    description: 'Awarded for making 5 or more donations',
+    requirement: '5 donations'
+  },
+  {
+    id: 'life_saver',
+    name: 'Life Saver',
+    description: 'Your donations have impacted 50 or more lives',
+    requirement: '50 lives impacted'
+  }
+];
 
 // Get user's rewards status
 router.get('/status', auth, async (req, res) => {
   try {
     const user = await User.findById(req.user._id)
-      .select('rewardPoints level levelProgress badges streak');
+      .select('rewardPoints level levelProgress badges streak donationCount')
+      .lean();
 
-    const nextLevel = {
-      Bronze: { next: 'Silver', pointsNeeded: 1000 },
-      Silver: { next: 'Gold', pointsNeeded: 2500 },
-      Gold: { next: 'Platinum', pointsNeeded: 5000 },
-      Platinum: { next: null, pointsNeeded: null }
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    const currentLevel = LEVELS[user.level];
+    const response = {
+      success: true,
+      data: {
+        currentPoints: user.rewardPoints,
+        currentLevel: user.level,
+        levelProgress: calculateLevelProgress(user.donationCount, user.level),
+        nextLevel: currentLevel.next,
+        pointsToNextLevel: currentLevel.pointsNeeded,
+        pointsProgress: (user.rewardPoints / (currentLevel.pointsNeeded || user.rewardPoints)) * 100,
+        badges: user.badges,
+        streak: user.streak,
+        multiplier: calculatePointsMultiplier(user.level)
+      }
     };
 
-    res.json({
-      currentPoints: user.rewardPoints,
-      currentLevel: user.level,
-      levelProgress: user.levelProgress,
-      nextLevel: nextLevel[user.level].next,
-      pointsToNextLevel: nextLevel[user.level].pointsNeeded,
-      badges: user.badges,
-      streak: user.streak
-    });
+    res.json(response);
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Server error' });
+    console.error('Get rewards status error:', err);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch rewards status'
+    });
   }
 });
 
@@ -36,177 +77,125 @@ router.get('/status', auth, async (req, res) => {
 router.get('/badges', auth, async (req, res) => {
   try {
     const user = await User.findById(req.user._id)
-      .select('badges donationCount livesImpacted');
+      .select('badges donationCount livesImpacted')
+      .lean();
 
-    const allBadges = [
-      {
-        id: 'first_donation',
-        name: 'First Donation',
-        description: 'Awarded for your first blood donation',
-        requirement: '1 donation',
-        earned: user.badges.includes('First Donation')
-      },
-      {
-        id: 'regular_donor',
-        name: 'Regular Donor',
-        description: 'Awarded for making 5 or more donations',
-        requirement: '5 donations',
-        earned: user.badges.includes('Regular Donor'),
-        progress: Math.min(user.donationCount / 5 * 100, 100)
-      },
-      {
-        id: 'life_saver',
-        name: 'Life Saver',
-        description: 'Your donations have impacted 50 or more lives',
-        requirement: '50 lives impacted',
-        earned: user.badges.includes('Life Saver'),
-        progress: Math.min(user.livesImpacted / 50 * 100, 100)
-      }
-    ];
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
 
-    res.json(allBadges);
+    const badgesWithProgress = BADGES.map(badge => ({
+      ...badge,
+      earned: user.badges.includes(badge.name),
+      progress: calculateBadgeProgress(badge.id, user)
+    }));
+
+    res.json({
+      success: true,
+      data: badgesWithProgress
+    });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Server error' });
+    console.error('Get badges error:', err);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch badges'
+    });
   }
 });
 
 // Get leaderboard
-router.get('/leaderboard', auth, async (req, res) => {
+router.get('/leaderboard', [
+  auth,
+  query('type').optional().isIn(['points', 'donations', 'streak', 'lives']),
+  query('limit').optional().isInt({ min: 1, max: 100 }),
+  query('page').optional().isInt({ min: 1 })
+], async (req, res) => {
   try {
-    const { type = 'points', limit = 10 } = req.query;
+    const { type = 'points', limit = 10, page = 1 } = req.query;
+    const skip = (page - 1) * limit;
 
-    let sortField;
-    switch (type) {
-      case 'donations':
-        sortField = 'donationCount';
-        break;
-      case 'streak':
-        sortField = 'streak';
-        break;
-      case 'lives':
-        sortField = 'livesImpacted';
-        break;
-      default:
-        sortField = 'rewardPoints';
-    }
+    const sortField = {
+      points: 'rewardPoints',
+      donations: 'donationCount',
+      streak: 'streak',
+      lives: 'livesImpacted'
+    }[type];
 
-    const leaderboard = await User.find({ isDonor: true })
-      .select(`name ${sortField} level badges`)
-      .sort({ [sortField]: -1 })
-      .limit(parseInt(limit));
-
-    // Get user's rank
-    const userRank = await User.countDocuments({
-      isDonor: true,
-      [sortField]: { $gt: req.user[sortField] }
-    }) + 1;
+    const [leaderboard, total, userRank] = await Promise.all([
+      User.find({ isDonor: true })
+        .select(`name ${sortField} level badges picture`)
+        .sort({ [sortField]: -1 })
+        .skip(skip)
+        .limit(parseInt(limit))
+        .lean(),
+      User.countDocuments({ isDonor: true }),
+      User.countDocuments({
+        isDonor: true,
+        [sortField]: { $gt: req.user[sortField] }
+      })
+    ]);
 
     res.json({
-      leaderboard,
-      userRank,
-      userScore: req.user[sortField]
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// Get level requirements
-router.get('/levels', auth, async (req, res) => {
-  try {
-    const levels = [
-      {
-        name: 'Bronze',
-        requirement: '0-9 donations',
-        perks: ['Basic donor badge', 'Access to donation history']
-      },
-      {
-        name: 'Silver',
-        requirement: '10-24 donations',
-        perks: ['Silver donor badge', 'Priority support', '10% bonus points']
-      },
-      {
-        name: 'Gold',
-        requirement: '25-49 donations',
-        perks: ['Gold donor badge', 'VIP support', '25% bonus points', 'Early access to blood drives']
-      },
-      {
-        name: 'Platinum',
-        requirement: '50+ donations',
-        perks: ['Platinum donor badge', 'Dedicated support line', '50% bonus points', 'Special recognition at events']
+      success: true,
+      data: {
+        leaderboard,
+        pagination: {
+          current: page,
+          total: Math.ceil(total / limit),
+          limit
+        },
+        userStats: {
+          rank: userRank + 1,
+          score: req.user[sortField],
+          total
+        }
       }
-    ];
-
-    res.json(levels);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// Get user's achievement history
-router.get('/achievements', auth, async (req, res) => {
-  try {
-    const user = await User.findById(req.user._id)
-      .select('badges level donationCount streak livesImpacted');
-
-    const achievements = [];
-
-    // Add badge achievements
-    user.badges.forEach(badge => {
-      achievements.push({
-        type: 'badge',
-        title: badge,
-        description: `Earned the ${badge} badge`,
-        date: new Date() // In a real app, you'd store the date when each badge was earned
-      });
     });
-
-    // Add level achievements
-    const levels = ['Bronze', 'Silver', 'Gold', 'Platinum'];
-    const currentLevelIndex = levels.indexOf(user.level);
-    for (let i = 0; i <= currentLevelIndex; i++) {
-      achievements.push({
-        type: 'level',
-        title: `Reached ${levels[i]} Level`,
-        description: `Advanced to ${levels[i]} donor status`,
-        date: new Date() // In a real app, you'd store the date when each level was reached
-      });
-    }
-
-    // Add milestone achievements
-    if (user.donationCount >= 10) {
-      achievements.push({
-        type: 'milestone',
-        title: '10 Donations',
-        description: 'Completed 10 blood donations',
-        date: new Date()
-      });
-    }
-    if (user.livesImpacted >= 30) {
-      achievements.push({
-        type: 'milestone',
-        title: '30 Lives Impacted',
-        description: 'Your donations have helped 30 people',
-        date: new Date()
-      });
-    }
-    if (user.streak >= 4) {
-      achievements.push({
-        type: 'milestone',
-        title: '4x Streak',
-        description: 'Maintained a 4 donation streak',
-        date: new Date()
-      });
-    }
-
-    res.json(achievements);
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Server error' });
+    console.error('Get leaderboard error:', err);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch leaderboard'
+    });
   }
 });
+
+// Helper functions
+function calculateLevelProgress(donationCount, currentLevel) {
+  const level = LEVELS[currentLevel];
+  if (!level.next) return 100;
+  const nextLevel = LEVELS[level.next];
+  return Math.min(
+    ((donationCount - level.donationsNeeded) /
+    (nextLevel.donationsNeeded - level.donationsNeeded)) * 100,
+    100
+  );
+}
+
+function calculatePointsMultiplier(level) {
+  const multipliers = {
+    Bronze: 1,
+    Silver: 1.1,
+    Gold: 1.25,
+    Platinum: 1.5
+  };
+  return multipliers[level] || 1;
+}
+
+function calculateBadgeProgress(badgeId, user) {
+  switch (badgeId) {
+    case 'first_donation':
+      return user.donationCount > 0 ? 100 : 0;
+    case 'regular_donor':
+      return Math.min((user.donationCount / 5) * 100, 100);
+    case 'life_saver':
+      return Math.min((user.livesImpacted / 50) * 100, 100);
+    default:
+      return 0;
+  }
+}
 
 module.exports = router;
