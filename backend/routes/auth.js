@@ -21,13 +21,16 @@ const validate = (req, res, next) => {
 // Register user
 router.post('/register', [
   body('email').isEmail().normalizeEmail(),
-  body('password').isLength({ min: 8 }),
-  body('name').trim().notEmpty(),
-  body('bloodGroup').isIn(['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-']),
+  body('password').isLength({ min: 8 }).withMessage('Password must be at least 8 characters long'),
+  body('name').trim().notEmpty().withMessage('Name is required'),
+  body('bloodGroup').isIn(['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-']).withMessage('Invalid blood group'),
+  body('phone').optional().matches(/^\+?[\d\s-]{10,}$/).withMessage('Invalid phone number format'),
+  body('address').trim().notEmpty().withMessage('Address is required'),
+  body('role').isIn(['donor', 'recipient']).withMessage('Invalid role'),
   validate
 ], async (req, res) => {
   try {
-    const { email, password, name, bloodGroup } = req.body;
+    const { email, password, name, bloodGroup, phone, address, role } = req.body;
 
     const userExists = await User.findOne({ email });
     if (userExists) {
@@ -42,7 +45,10 @@ router.post('/register', [
       email,
       password: hashedPassword,
       name,
-      bloodGroup
+      bloodGroup,
+      'contact.phone': phone,
+      'contact.address.street': address,
+      'roles.isDonor': role === 'donor'
     });
 
     await user.save();
@@ -61,7 +67,10 @@ router.post('/register', [
           _id: user._id,
           name: user.name,
           email: user.email,
-          bloodGroup: user.bloodGroup
+          bloodGroup: user.bloodGroup,
+          phone: user.contact.phone,
+          address: user.contact.address.street,
+          role: user.roles.isDonor ? 'donor' : 'recipient'
         }
       }
     });

@@ -10,6 +10,7 @@ const path = require('path');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const compression = require('compression');
+const fs = require('fs');
 
 // Import routes
 const authRoutes = require('./routes/auth');
@@ -85,23 +86,36 @@ app.use(morgan('dev'));
 app.use('/uploads', express.static('uploads'));
 
 // Ensure upload directory exists
-const fs = require('fs');
 if (!fs.existsSync('uploads')) {
   fs.mkdirSync('uploads', { recursive: true });
 }
 
 // Enhanced database connection with retry
 const connectDB = async () => {
-  try {
-    await mongoose.connect(process.env.MONGODB_URI, {
-      useNewUrlParser: true,
-      useUnifiedTopology: true
-    });
-    console.log('Connected to MongoDB');
-  } catch (err) {
-    console.error('MongoDB connection error:', err);
-    process.exit(1);
-  }
+  const retryLimit = 5;
+  let retries = 0;
+
+  const tryConnect = async () => {
+    try {
+      await mongoose.connect(process.env.MONGODB_URI, {
+        useNewUrlParser: true,
+        useUnifiedTopology: true
+      });
+      console.log('Connected to MongoDB');
+    } catch (err) {
+      console.error(`MongoDB connection error (attempt ${retries + 1}):`, err);
+      if (retries < retryLimit) {
+        retries++;
+        console.log(`Retrying in 5 seconds...`);
+        setTimeout(tryConnect, 5000);
+      } else {
+        console.error('Max retries reached. Exiting...');
+        process.exit(1);
+      }
+    }
+  };
+
+  await tryConnect();
 };
 
 connectDB();
@@ -219,3 +233,5 @@ process.on('SIGTERM', () => {
     });
   });
 });
+
+module.exports = app;
